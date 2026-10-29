@@ -103,11 +103,27 @@ func (s *Session) AuthMechanisms() []string {
 }
 
 func (s *Session) Auth(mech string) (sasl.Server, error) {
-	return s.endp.saslAuth.CreateSASL(mech, s.connState.RemoteAddr, func(identity string, data auth.ContextData) error {
+	serv := s.endp.saslAuth.CreateSASL(mech, s.connState.RemoteAddr, func(identity string, data auth.ContextData) error {
 		s.connState.AuthUser = identity
 		s.connState.AuthPassword = data.Password
 		return nil
-	}), nil
+	})
+	return &countingSASLServer{Server: serv, endpName: s.endp.name}, nil
+}
+
+// countingSASLServer increments the failed logins counter when the wrapped
+// SASL exchange fails.
+type countingSASLServer struct {
+	sasl.Server
+	endpName string
+}
+
+func (c *countingSASLServer) Next(response []byte) ([]byte, bool, error) {
+	challenge, done, err := c.Server.Next(response)
+	if err != nil {
+		failedLogins.WithLabelValues(c.endpName).Inc()
+	}
+	return challenge, done, err
 }
 
 func (s *Session) Reset() {

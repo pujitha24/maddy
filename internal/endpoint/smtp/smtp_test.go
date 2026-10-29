@@ -39,6 +39,8 @@ import (
 	"github.com/foxcpp/maddy/internal/auth"
 	"github.com/foxcpp/maddy/internal/msgpipeline"
 	"github.com/foxcpp/maddy/internal/testutils"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -632,6 +634,52 @@ func TestSMTPDelivery_SubmissionAuthOK(t *testing.T) {
 	if msg.Header.Get("Message-ID") == "" {
 		t.Error("No submissionPrepare run")
 	}
+}
+
+type failingAuth struct{}
+
+func (failingAuth) AuthPlain(string, string) error {
+	return exterrors.WithTemporary(auth.ErrInvalidAuthCred, false)
+}
+
+func failedLoginsValue(t *testing.T, module string) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, failedLogins.WithLabelValues(module).Write(&m))
+	return m.GetCounter().GetValue()
+}
+
+func TestSMTPDelivery_SubmissionAuthFailedLoginsMetric(t *testing.T) {
+	tgt := testutils.Target{}
+	endp := testEndpoint(t, "submission", failingAuth{}, &tgt, nil, nil)
+	defer func() {
+		assert.NoError(t, endp.Stop())
+	}()
+
+	cl, err := smtp.Dial("127.0.0.1:" + testPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		assert.NoError(t, cl.Close())
+	}()
+
+	before := failedLoginsValue(t, endp.name)
+	if err := cl.Auth(sasl.NewPlainClient("", "user", "wrong")); err == nil {
+		t.Fatal("Expected an error, got none")
+	}
+	assert.Equal(t, before+1, failedLoginsValue(t, endp.name))
+
+	// Registered with the default registry, so it is visible on /metrics.
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "maddy_smtp_failed_logins" {
+			found = true
+		}
+	}
+	assert.True(t, found, "maddy_smtp_failed_logins is not registered")
 }
 
 func TestMain(m *testing.M) {
